@@ -1,9 +1,26 @@
-console.log("Duplicate Thumbnail Highlighter: Sprint 1 (Visual Prototype) Loaded");
+console.log("Duplicate Thumbnail Highlighter: Loaded");
 
-// --- SPRINT 1: VISUALS ---
+// --- CONFIGURATION ---
 
-// Hamming threshold for near-duplicate detection (lower = stricter)
+/**
+ * Hamming distance threshold for near-duplicate detection.
+ * - Lower = stricter matching (fewer false positives, may miss similar images)
+ * - Higher = looser matching (catches more duplicates, but may have false positives)
+ *
+ * With a 32x31 dHash (992 bits / 248 hex chars), typical thresholds:
+ * - 0: Exact match only
+ * - 5: Very similar images (compression artifacts, slight crops) [RECOMMENDED]
+ * - 10: Moderately similar (same scene, different quality)
+ * - 15+: Loose matching (may catch unrelated images)
+ */
 const HAMMING_THRESHOLD = 5;
+
+/**
+ * Maximum number of entries to keep in memory maps.
+ * Prevents unbounded memory growth on infinite-scroll pages.
+ * When limit is reached, oldest entries are evicted (LRU-style).
+ */
+const MAX_CACHE_ENTRIES = 5000;
 
 /**
  * Returns CSS styles based on duplicate count.
@@ -149,18 +166,50 @@ function isSolidColor(hash) {
     return /^0+$/.test(hash) || /^f+$/.test(hash);
 }
 
-// --- SPRINT 2: INDEXED DB WIRING ---
+// --- MEMORY MANAGEMENT ---
 
 // Track which image SRC URLs we've already processed (survives virtualized scrolling)
-// src URL -> hash
+// src URL -> { hash, timestamp }
 const processedSrcUrls = new Map();
 
 // Track which image SRCs share the same hash (for finding duplicates)
 // hash -> Set of src URLs
 const hashToSrcUrls = new Map();
 
+/**
+ * Evicts oldest entries from the cache when it exceeds MAX_CACHE_ENTRIES.
+ * Uses insertion order (Map maintains insertion order in JS).
+ */
+function evictOldestEntries() {
+    if (processedSrcUrls.size <= MAX_CACHE_ENTRIES) return;
+
+    const entriesToRemove = processedSrcUrls.size - MAX_CACHE_ENTRIES;
+    let removed = 0;
+
+    for (const [src, data] of processedSrcUrls) {
+        if (removed >= entriesToRemove) break;
+
+        // Remove from processedSrcUrls
+        processedSrcUrls.delete(src);
+
+        // Remove from hashToSrcUrls
+        const hash = data.hash || data; // Handle both old and new format
+        if (hashToSrcUrls.has(hash)) {
+            const srcSet = hashToSrcUrls.get(hash);
+            srcSet.delete(src);
+            if (srcSet.size === 0) {
+                hashToSrcUrls.delete(hash);
+            }
+        }
+        removed++;
+    }
+
+    if (removed > 0) {
+        console.log(`[DuplicateHighlighter] Evicted ${removed} old entries from cache`);
+    }
+}
+
 async function processPage() {
-    console.log("Scanning Page...");
     const imgs = document.querySelectorAll('img');
 
     const validImgs = Array.from(imgs).filter(img => {
@@ -170,7 +219,8 @@ async function processPage() {
         return isValid;
     });
 
-    console.log(`Found ${validImgs.length} valid thumbnails on page.`);
+    // Evict old entries if cache is getting too large
+    evictOldestEntries();
 
     for (const img of validImgs) {
         const src = img.currentSrc || img.src;
@@ -178,7 +228,8 @@ async function processPage() {
         // Already processed this src URL?
         if (processedSrcUrls.has(src)) {
             // We already know its hash - just re-apply styling if it's a duplicate
-            const knownHash = processedSrcUrls.get(src);
+            const cachedData = processedSrcUrls.get(src);
+            const knownHash = cachedData.hash || cachedData; // Handle both formats
             const srcSet = hashToSrcUrls.get(knownHash);
             if (srcSet && srcSet.size > 1) {
                 markDuplicateThumbnail(img, srcSet.size);
@@ -187,15 +238,16 @@ async function processPage() {
         }
 
         // New src URL - need to hash it
-        window.ThumbHash.queueHash(src).then(async (realHash) => {
-            if (!realHash || isSolidColor(realHash)) return;
+        try {
+            const realHash = await window.ThumbHash.queueHash(src);
+            if (!realHash || isSolidColor(realHash)) continue;
 
             // Find matching hash (exact or near-duplicate)
             const matchKey = findMatchingHash(realHash, hashToSrcUrls);
             const targetKey = matchKey || realHash;
 
-            // Record this src -> hash mapping
-            processedSrcUrls.set(src, targetKey);
+            // Record this src -> hash mapping with timestamp
+            processedSrcUrls.set(src, { hash: targetKey, timestamp: Date.now() });
 
             // Track all src URLs that share this hash
             if (!hashToSrcUrls.has(targetKey)) {
@@ -205,13 +257,21 @@ async function processPage() {
 
             const matchingSrcs = hashToSrcUrls.get(targetKey);
 
+            // Persist to IndexedDB for cross-session duplicate detection
+            const pageUrl = window.location.href;
+            try {
+                await window.ThumbDB.upsertThumbnailRecord(targetKey, pageUrl);
+            } catch (dbError) {
+                console.warn('[DuplicateHighlighter] Failed to persist to IndexedDB:', dbError);
+            }
+
             // If multiple DIFFERENT src URLs produce the same hash = visual duplicate
             if (matchingSrcs.size > 1) {
                 console.log(`%c[DUPLICATE FOUND]`, 'background: red; color: white; padding: 2px 6px;', {
                     hash: targetKey.substring(0, 16) + '...',
                     matchingSrcUrls: Array.from(matchingSrcs)
                 });
-                
+
                 // Mark all currently visible images that match this hash
                 document.querySelectorAll('img').forEach(pageImg => {
                     if (matchingSrcs.has(pageImg.src)) {
@@ -219,7 +279,9 @@ async function processPage() {
                     }
                 });
             }
-        });
+        } catch (error) {
+            console.warn('[DuplicateHighlighter] Failed to process image:', src, error);
+        }
     }
 }
 
@@ -267,7 +329,7 @@ const observer = new MutationObserver(() => {
 // Start observing the document body for added nodes
 observer.observe(document.body, { childList: true, subtree: true });
 
-console.log("Sprint 3: MutationObserver started. Waiting for content...");
+console.log("[DuplicateHighlighter] MutationObserver started. Watching for content changes...");
 
 // Initial check in case content is already there
 setTimeout(processPage, 1000);

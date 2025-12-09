@@ -1,12 +1,34 @@
 /**
- * Sprint 3: Hashing Logic & Throttling
+ * Perceptual Hashing Module (dHash)
  * Exposed as window.ThumbHash
+ *
+ * Uses "difference hash" algorithm:
+ * 1. Resize image to small square (32x32)
+ * 2. Compare adjacent pixel brightness
+ * 3. Generate binary hash based on brightness differences
+ *
+ * This produces a hash that's resilient to:
+ * - Image resizing
+ * - Minor color adjustments
+ * - Compression artifacts
  */
 (function () {
 
     // --- CONFIG ---
-    const TARGET_SIZE = 32; // resize to 32x32
-    const THROTTLE_MS = 200; // Wait 200ms between processing images
+
+    /**
+     * Target size for image resizing before hashing.
+     * 32x32 provides good balance of accuracy vs performance.
+     * Produces a 32x31 = 992 bit hash (248 hex characters).
+     */
+    const TARGET_SIZE = 32;
+
+    /**
+     * Throttle delay between processing images (milliseconds).
+     * Prevents overwhelming the browser when many images are queued.
+     * 200ms allows ~5 images/second which is sufficient for scrolling.
+     */
+    const THROTTLE_MS = 200;
 
     // Reuse a single canvas to save memory
     const canvas = document.createElement('canvas');
@@ -122,10 +144,19 @@
         });
     }
 
+    /**
+     * Converts a binary string to hexadecimal.
+     * Pads the final chunk if needed to ensure consistent output.
+     */
     function binToHex(bin) {
         let hex = '';
         for (let i = 0; i < bin.length; i += 4) {
-            const chunk = bin.substr(i, 4);
+            // Use slice() instead of deprecated substr()
+            let chunk = bin.slice(i, i + 4);
+            // Pad with zeros if final chunk is less than 4 bits
+            while (chunk.length < 4) {
+                chunk += '0';
+            }
             hex += parseInt(chunk, 2).toString(16);
         }
         return hex;
