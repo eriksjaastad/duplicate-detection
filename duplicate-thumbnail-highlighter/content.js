@@ -22,6 +22,12 @@ const HAMMING_THRESHOLD = 5;
  */
 const MAX_CACHE_ENTRIES = 5000;
 
+/**
+ * Maximum number of failed URLs to track.
+ * Prevents memory leak if many images fail to load (404s, CORS issues, etc).
+ */
+const MAX_FAILED_ENTRIES = 1000;
+
 // --- VISUAL STYLING ---
 
 /**
@@ -185,31 +191,46 @@ const hashToSrcUrls = new Map();
 const failedUrls = new Set();
 
 /**
- * Evicts oldest entries from the cache when it exceeds MAX_CACHE_ENTRIES.
+ * Evicts oldest entries from caches when they exceed their limits.
  */
 function evictOldestEntries() {
-    if (processedSrcUrls.size <= MAX_CACHE_ENTRIES) return;
+    // Evict from processedSrcUrls and hashToSrcUrls
+    if (processedSrcUrls.size > MAX_CACHE_ENTRIES) {
+        const entriesToRemove = processedSrcUrls.size - MAX_CACHE_ENTRIES;
+        let removed = 0;
 
-    const entriesToRemove = processedSrcUrls.size - MAX_CACHE_ENTRIES;
-    let removed = 0;
+        for (const [src, hash] of processedSrcUrls) {
+            if (removed >= entriesToRemove) break;
 
-    for (const [src, hash] of processedSrcUrls) {
-        if (removed >= entriesToRemove) break;
+            processedSrcUrls.delete(src);
 
-        processedSrcUrls.delete(src);
-
-        if (hashToSrcUrls.has(hash)) {
-            const srcSet = hashToSrcUrls.get(hash);
-            srcSet.delete(src);
-            if (srcSet.size === 0) {
-                hashToSrcUrls.delete(hash);
+            if (hashToSrcUrls.has(hash)) {
+                const srcSet = hashToSrcUrls.get(hash);
+                srcSet.delete(src);
+                if (srcSet.size === 0) {
+                    hashToSrcUrls.delete(hash);
+                }
             }
+            removed++;
         }
-        removed++;
+
+        if (removed > 0) {
+            console.log(`[DuplicateHighlighter] Evicted ${removed} old entries from cache`);
+        }
     }
 
-    if (removed > 0) {
-        console.log(`[DuplicateHighlighter] Evicted ${removed} old entries from cache`);
+    // Evict from failedUrls (clear oldest half when limit exceeded)
+    if (failedUrls.size > MAX_FAILED_ENTRIES) {
+        const entriesToRemove = Math.floor(failedUrls.size / 2);
+        let removed = 0;
+
+        for (const url of failedUrls) {
+            if (removed >= entriesToRemove) break;
+            failedUrls.delete(url);
+            removed++;
+        }
+
+        console.log(`[DuplicateHighlighter] Evicted ${removed} failed URL entries`);
     }
 }
 
