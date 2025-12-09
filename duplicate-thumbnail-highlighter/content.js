@@ -1,16 +1,41 @@
-console.log("Duplicate Thumbnail Highlighter: Sprint 1 (Visual Prototype) Loaded");
+console.log("[DuplicateHighlighter] Loaded");
 
-// --- SPRINT 1: VISUALS ---
+// --- CONFIGURATION ---
 
-// Hamming threshold for near-duplicate detection (lower = stricter)
+/**
+ * Hamming distance threshold for near-duplicate detection.
+ * - Lower = stricter matching (fewer false positives, may miss similar images)
+ * - Higher = looser matching (catches more duplicates, but may have false positives)
+ *
+ * With a 32x31 dHash (992 bits / 248 hex chars), typical thresholds:
+ * - 0: Exact match only
+ * - 5: Very similar images (compression artifacts, slight crops) [RECOMMENDED]
+ * - 10: Moderately similar (same scene, different quality)
+ * - 15+: Loose matching (may catch unrelated images)
+ */
 const HAMMING_THRESHOLD = 5;
+
+/**
+ * Maximum number of entries to keep in memory maps.
+ * Prevents unbounded memory growth on infinite-scroll pages.
+ * When limit is reached, oldest entries are evicted (LRU-style).
+ */
+const MAX_CACHE_ENTRIES = 5000;
+
+/**
+ * Maximum number of failed URLs to track.
+ * Prevents memory leak if many images fail to load (404s, CORS issues, etc).
+ */
+const MAX_FAILED_ENTRIES = 1000;
+
+// --- VISUAL STYLING ---
 
 /**
  * Returns CSS styles based on duplicate count.
  * Count 1 = New (No style)
- * Count 2 = Green (Low dup)
- * Count 5 = Yellow
- * Count 10+ = Red
+ * Count 2 = Blue (Low dup)
+ * Count 5+ = Trending toward Red
+ * Count 10+ = Red (High dup)
  */
 function styleForCount(count) {
     if (count <= 1) return null;
@@ -19,20 +44,16 @@ function styleForCount(count) {
     const clamped = Math.min(count, maxCount);
     const t = (clamped - 1) / (maxCount - 1); // 0..1 range
 
-    // Color-Blind Friendly Palette (Blue -> Orange/Magenta) & Patterns
-    // Low count = Blue-ish, High count = Orange/Red-ish
-    // We keep HSL but shift hue: 200 (Blue) -> 0 (Red)
+    // Color-Blind Friendly Palette (Blue -> Orange/Red)
     const hue = 200 - (200 * t);
 
     // Pattern opacity
     const alpha = 0.3;
 
-    // Generate Striped Background
-    // Low count = Wide stripes
-    // High count = Tight stripes
+    // Generate Striped Background (wider stripes for low count, tighter for high)
     const stripeWidth = 20 - (15 * t); // 20px -> 5px
     const colorA = `hsla(${hue}, 100%, 50%, ${alpha})`;
-    const colorB = `hsla(${hue}, 100%, 50%, 0.05)`; // Almost clear
+    const colorB = `hsla(${hue}, 100%, 50%, 0.05)`;
 
     const pattern = `repeating-linear-gradient(
         45deg,
@@ -46,7 +67,6 @@ function styleForCount(count) {
         outline: `3px solid hsl(${hue}, 100%, 50%)`,
         outlineOffset: '-4px',
         badgeBg: `hsl(${hue}, 100%, 30%)`,
-        overlayBg: 'transparent', // We use backgroundImage now
         backgroundImage: pattern,
         badgeColor: '#fff',
         zIndex: 1000 + count
@@ -57,36 +77,34 @@ function styleForCount(count) {
  * Applies visual highlighting to an image element.
  */
 function markDuplicateThumbnail(img, count) {
-    // 1. Cleanup previous widgets
     const parent = img.parentElement;
     if (!parent) return;
 
-    // Cleanup existing
+    // Cleanup existing decorations
     const existingBadge = parent.querySelector('.dup-badge');
     if (existingBadge) existingBadge.remove();
     const existingOverlay = parent.querySelector('.dup-overlay');
     if (existingOverlay) existingOverlay.remove();
 
-    // 2. Clear styles if count is low
+    // Clear styles if count is low
     if (count <= 1) {
         img.style.outline = '';
         return;
     }
 
-    // 3. Compute Styles
     const styles = styleForCount(count);
 
-    // 4. Apply Outline (still useful for sharp edge)
+    // Apply Outline
     img.style.outline = styles.outline;
     img.style.outlineOffset = styles.outlineOffset;
 
-    // 5. Setup Parent
+    // Setup Parent for absolute positioning
     const computedStyle = window.getComputedStyle(parent);
     if (computedStyle.position === 'static') {
         parent.style.position = 'relative';
     }
 
-    // 6. Apply Overlay
+    // Apply Overlay with stripe pattern
     const overlay = document.createElement('div');
     overlay.className = 'dup-overlay';
     Object.assign(overlay.style, {
@@ -95,17 +113,18 @@ function markDuplicateThumbnail(img, count) {
         left: '0',
         width: '100%',
         height: '100%',
-        backgroundImage: styles.backgroundImage, // Apply Pattern
-        pointerEvents: 'none', // Allow clicks to pass through
+        backgroundImage: styles.backgroundImage,
+        pointerEvents: 'none',
         zIndex: styles.zIndex - 1,
-        borderRadius: 'inherit' // Try to match parent border radius
+        borderRadius: 'inherit'
     });
     parent.appendChild(overlay);
 
-    // 7. Apply Badge
+    // Apply Badge with count
     const badge = document.createElement('div');
     badge.className = 'dup-badge';
     badge.innerText = count;
+    badge.setAttribute('title', `Duplicate: ${count} copies on this page`);
 
     Object.assign(badge.style, {
         position: 'absolute',
@@ -125,6 +144,8 @@ function markDuplicateThumbnail(img, count) {
 
     parent.appendChild(badge);
 }
+
+// --- HASH MATCHING ---
 
 /**
  * Find a matching hash using exact match first, then Hamming distance.
@@ -149,9 +170,16 @@ function isSolidColor(hash) {
     return /^0+$/.test(hash) || /^f+$/.test(hash);
 }
 
-// --- SPRINT 2: INDEXED DB WIRING ---
+/**
+ * Get the effective source URL for an image (handles responsive images).
+ */
+function getImageSrc(img) {
+    return img.currentSrc || img.src;
+}
 
-// Track which image SRC URLs we've already processed (survives virtualized scrolling)
+// --- MEMORY MANAGEMENT ---
+
+// Track which image SRC URLs we've already processed
 // src URL -> hash
 const processedSrcUrls = new Map();
 
@@ -159,25 +187,86 @@ const processedSrcUrls = new Map();
 // hash -> Set of src URLs
 const hashToSrcUrls = new Map();
 
-async function processPage() {
-    console.log("Scanning Page...");
+// Track URLs that failed to hash (avoid retry loops)
+const failedUrls = new Set();
+
+/**
+ * Evicts oldest entries from caches when they exceed their limits.
+ */
+function evictOldestEntries() {
+    // Evict from processedSrcUrls and hashToSrcUrls
+    if (processedSrcUrls.size > MAX_CACHE_ENTRIES) {
+        const entriesToRemove = processedSrcUrls.size - MAX_CACHE_ENTRIES;
+        let removed = 0;
+
+        for (const [src, hash] of processedSrcUrls) {
+            if (removed >= entriesToRemove) break;
+
+            processedSrcUrls.delete(src);
+
+            if (hashToSrcUrls.has(hash)) {
+                const srcSet = hashToSrcUrls.get(hash);
+                srcSet.delete(src);
+                if (srcSet.size === 0) {
+                    hashToSrcUrls.delete(hash);
+                }
+            }
+            removed++;
+        }
+
+        if (removed > 0) {
+            console.log(`[DuplicateHighlighter] Evicted ${removed} old entries from cache`);
+        }
+    }
+
+    // Evict from failedUrls (clear oldest half when limit exceeded)
+    if (failedUrls.size > MAX_FAILED_ENTRIES) {
+        const entriesToRemove = Math.floor(failedUrls.size / 2);
+        let removed = 0;
+
+        for (const url of failedUrls) {
+            if (removed >= entriesToRemove) break;
+            failedUrls.delete(url);
+            removed++;
+        }
+
+        console.log(`[DuplicateHighlighter] Evicted ${removed} failed URL entries`);
+    }
+}
+
+/**
+ * Update all visible images that share a hash with new duplicate count.
+ */
+function updateAllMatchingImages(targetHash) {
+    const matchingSrcs = hashToSrcUrls.get(targetHash);
+    if (!matchingSrcs || matchingSrcs.size <= 1) return;
+
+    document.querySelectorAll('img').forEach(pageImg => {
+        const pageSrc = getImageSrc(pageImg);
+        if (matchingSrcs.has(pageSrc)) {
+            markDuplicateThumbnail(pageImg, matchingSrcs.size);
+        }
+    });
+}
+
+// --- PAGE PROCESSING ---
+
+function processPage() {
     const imgs = document.querySelectorAll('img');
 
     const validImgs = Array.from(imgs).filter(img => {
-        // Skip invalid images
         if (!img.src || img.src.startsWith('data:')) return false;
-        const isValid = img.naturalWidth > 100 && img.naturalHeight > 50;
-        return isValid;
+        return img.naturalWidth > 100 && img.naturalHeight > 50;
     });
 
-    console.log(`Found ${validImgs.length} valid thumbnails on page.`);
+    // Evict old entries if cache is getting too large
+    evictOldestEntries();
 
     for (const img of validImgs) {
-        const src = img.currentSrc || img.src;
+        const src = getImageSrc(img);
 
-        // Already processed this src URL?
+        // Skip if already processed
         if (processedSrcUrls.has(src)) {
-            // We already know its hash - just re-apply styling if it's a duplicate
             const knownHash = processedSrcUrls.get(src);
             const srcSet = hashToSrcUrls.get(knownHash);
             if (srcSet && srcSet.size > 1) {
@@ -186,11 +275,21 @@ async function processPage() {
             continue;
         }
 
-        // New src URL - need to hash it
-        window.ThumbHash.queueHash(src).then(async (realHash) => {
-            if (!realHash || isSolidColor(realHash)) return;
+        // Skip if previously failed
+        if (failedUrls.has(src)) continue;
 
-            // Find matching hash (exact or near-duplicate)
+        // Queue for hashing (non-blocking - allows parallel processing)
+        window.ThumbHash.queueHash(src).then((realHash) => {
+            // Handle failure
+            if (!realHash) {
+                failedUrls.add(src);
+                return;
+            }
+
+            // Skip solid-color placeholders
+            if (isSolidColor(realHash)) return;
+
+            // Find matching hash (exact or near-duplicate via Hamming)
             const matchKey = findMatchingHash(realHash, hashToSrcUrls);
             const targetKey = matchKey || realHash;
 
@@ -207,67 +306,73 @@ async function processPage() {
 
             // If multiple DIFFERENT src URLs produce the same hash = visual duplicate
             if (matchingSrcs.size > 1) {
-                console.log(`%c[DUPLICATE FOUND]`, 'background: red; color: white; padding: 2px 6px;', {
+                console.log(`%c[DUPLICATE FOUND]`, 'background: #c41; color: white; padding: 2px 6px; border-radius: 3px;', {
                     hash: targetKey.substring(0, 16) + '...',
-                    matchingSrcUrls: Array.from(matchingSrcs)
+                    count: matchingSrcs.size
                 });
-                
+
                 // Mark all currently visible images that match this hash
-                document.querySelectorAll('img').forEach(pageImg => {
-                    if (matchingSrcs.has(pageImg.src)) {
-                        markDuplicateThumbnail(pageImg, matchingSrcs.size);
-                    }
-                });
+                updateAllMatchingImages(targetKey);
             }
         });
     }
 }
 
-// Helper to clear DB from console
-window.resetAllData = async () => {
-    console.log("Resetting all data...");
-    await window.ThumbDB.clearAllThumbs();
-    location.reload();
-};
+// --- KEYBOARD SHORTCUTS ---
 
-// Keyboard Shortcut: Alt + Shift + R = Reset
+// Alt + Shift + R = Reset all data and reload
 window.addEventListener('keydown', (e) => {
     if (e.altKey && e.shiftKey && e.code === 'KeyR') {
-        window.resetAllData();
+        console.log("[DuplicateHighlighter] Resetting...");
+        processedSrcUrls.clear();
+        hashToSrcUrls.clear();
+        failedUrls.clear();
+        location.reload();
     }
 });
 
-// Keyboard Shortcut: Alt + Shift + D = Debug dump
-window.addEventListener('keydown', async (e) => {
+// Alt + Shift + D = Debug dump
+window.addEventListener('keydown', (e) => {
     if (e.altKey && e.shiftKey && e.code === 'KeyD') {
-        console.log('%c[DEBUG DUMP] Fetching all stored hashes...', 'background: blue; color: white; padding: 2px 6px;');
-        const allRecords = await window.ThumbDB.getAllRecords();
-        console.log(`Found ${allRecords.length} unique hashes in database:`);
-        console.table(allRecords.map(r => ({
-            hash: r.hash.substring(0, 16) + '...',
-            count: r.count,
-            pages: r.urls?.length || 0,
-            urls: r.urls?.join(' | ').substring(0, 100) || 'N/A'
-        })));
-        console.log('Full records:', allRecords);
+        console.log('%c[DEBUG DUMP]', 'background: #36c; color: white; padding: 2px 6px; border-radius: 3px;');
+        console.log('Processed URLs:', processedSrcUrls.size);
+        console.log('Unique hashes:', hashToSrcUrls.size);
+        console.log('Failed URLs:', failedUrls.size);
+        
+        // Show duplicate groups
+        const duplicates = [];
+        for (const [hash, srcSet] of hashToSrcUrls) {
+            if (srcSet.size > 1) {
+                duplicates.push({
+                    hash: hash.substring(0, 16) + '...',
+                    count: srcSet.size,
+                    urls: Array.from(srcSet).map(u => u.substring(0, 60) + '...')
+                });
+            }
+        }
+        console.table(duplicates);
     }
 });
 
-// Start logic
+// Alt + Shift + S = Rescan page now
+window.addEventListener('keydown', (e) => {
+    if (e.altKey && e.shiftKey && e.code === 'KeyS') {
+        console.log("[DuplicateHighlighter] Manual rescan triggered");
+        processPage();
+    }
+});
+
 // --- MUTATION OBSERVER (SPA SUPPORT) ---
 
 let debounceTimer = null;
 const observer = new MutationObserver(() => {
-    // When DOM changes, wait for a quiet period (1 sec) then scan
-    // This prevents running 100 times while React is rendering a list
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(processPage, 1000);
 });
 
-// Start observing the document body for added nodes
 observer.observe(document.body, { childList: true, subtree: true });
 
-console.log("Sprint 3: MutationObserver started. Waiting for content...");
+console.log("[DuplicateHighlighter] Watching for content changes...");
 
-// Initial check in case content is already there
+// Initial scan
 setTimeout(processPage, 1000);
