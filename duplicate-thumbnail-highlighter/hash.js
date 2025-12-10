@@ -24,11 +24,11 @@
     const TARGET_SIZE = 32;
 
     /**
-     * Throttle delay between processing images (milliseconds).
-     * Prevents overwhelming the browser when many images are queued.
-     * 200ms allows ~5 images/second which is sufficient for scrolling.
+     * Maximum concurrent hash operations.
+     * 5 matches typical 5-column thumbnail layouts and stays under
+     * browser's ~6 concurrent connections per origin limit.
      */
-    const THROTTLE_MS = 200;
+    const MAX_CONCURRENT = 5;
 
     // Reuse a single canvas to save memory
     const canvas = document.createElement('canvas');
@@ -39,7 +39,7 @@
 
     // Queue system
     const queue = [];
-    let isProcessing = false;
+    let activeCount = 0;
 
     /**
      * The Public API: Enqueues a request to hash an image URL.
@@ -53,25 +53,23 @@
     }
 
     function processQueue() {
-        if (isProcessing || queue.length === 0) return;
+        // Process up to MAX_CONCURRENT items simultaneously
+        while (activeCount < MAX_CONCURRENT && queue.length > 0) {
+            activeCount++;
+            const task = queue.shift();
 
-        isProcessing = true;
-        const task = queue.shift();
-
-        // Run the hash task
-        computeHashInternal(task.url)
-            .then(hash => task.resolve(hash))
-            .catch(err => {
-                console.warn("Hash failed:", err);
-                task.resolve(null);
-            })
-            .finally(() => {
-                // Wait for throttle before next item
-                setTimeout(() => {
-                    isProcessing = false;
-                    processQueue();
-                }, THROTTLE_MS);
-            });
+            // Run the hash task
+            computeHashInternal(task.url)
+                .then(hash => task.resolve(hash))
+                .catch(err => {
+                    console.warn("Hash failed:", err);
+                    task.resolve(null);
+                })
+                .finally(() => {
+                    activeCount--;
+                    processQueue(); // Try to fill the slot
+                });
+        }
     }
 
     /**

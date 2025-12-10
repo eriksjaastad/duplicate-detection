@@ -251,71 +251,137 @@ function updateAllMatchingImages(targetHash) {
 
 // --- PAGE PROCESSING ---
 
-function processPage() {
-    const imgs = document.querySelectorAll('img');
+/**
+ * Process a single image: hash it and check for duplicates.
+ * Called when an image enters the viewport.
+ */
+function processImage(img) {
+    const src = getImageSrc(img);
 
-    const validImgs = Array.from(imgs).filter(img => {
-        if (!img.src || img.src.startsWith('data:')) return false;
-        return img.naturalWidth > 100 && img.naturalHeight > 50;
+    // Skip if already processed - just re-apply highlighting
+    if (processedSrcUrls.has(src)) {
+        const knownHash = processedSrcUrls.get(src);
+        const srcSet = hashToSrcUrls.get(knownHash);
+        if (srcSet && srcSet.size > 1) {
+            markDuplicateThumbnail(img, srcSet.size);
+        }
+        return;
+    }
+
+    // Skip if previously failed
+    if (failedUrls.has(src)) return;
+
+    // Queue for hashing (non-blocking - allows parallel processing)
+    window.ThumbHash.queueHash(src).then((realHash) => {
+        // Handle failure
+        if (!realHash) {
+            failedUrls.add(src);
+            return;
+        }
+
+        // Skip solid-color placeholders
+        if (isSolidColor(realHash)) return;
+
+        // Find matching hash (exact or near-duplicate via Hamming)
+        const matchKey = findMatchingHash(realHash, hashToSrcUrls);
+        const targetKey = matchKey || realHash;
+
+        // Record this src -> hash mapping
+        processedSrcUrls.set(src, targetKey);
+
+        // Track all src URLs that share this hash
+        if (!hashToSrcUrls.has(targetKey)) {
+            hashToSrcUrls.set(targetKey, new Set());
+        }
+        hashToSrcUrls.get(targetKey).add(src);
+
+        const matchingSrcs = hashToSrcUrls.get(targetKey);
+
+        // If multiple DIFFERENT src URLs produce the same hash = visual duplicate
+        if (matchingSrcs.size > 1) {
+            console.log(`%c[DUPLICATE FOUND]`, 'background: #c41; color: white; padding: 2px 6px; border-radius: 3px;', {
+                hash: targetKey.substring(0, 16) + '...',
+                count: matchingSrcs.size
+            });
+
+            // Mark all currently visible images that match this hash
+            updateAllMatchingImages(targetKey);
+        }
     });
+}
 
+/**
+ * Check if an image is valid for processing.
+ */
+function isValidImage(img) {
+    if (!img.src || img.src.startsWith('data:')) return false;
+    return img.naturalWidth > 100 && img.naturalHeight > 50;
+}
+
+// --- INTERSECTION OBSERVER (VIEWPORT-BASED PROCESSING) ---
+
+// Track images we're already observing to avoid duplicates
+const observedImages = new WeakSet();
+
+/**
+ * IntersectionObserver that triggers hashing when images enter viewport.
+ * Uses rootMargin to pre-fetch images slightly before they're visible.
+ */
+const imageObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+        if (entry.isIntersecting) {
+            const img = entry.target;
+            
+            // Stop observing this image
+            imageObserver.unobserve(img);
+            
+            // Process it if valid
+            if (isValidImage(img)) {
+                processImage(img);
+            }
+        }
+    }
+}, {
+    rootMargin: '500px', // Start processing 500px before image is visible
+    threshold: 0
+});
+
+/**
+ * Scan the page for new images and observe them.
+ * Called on initial load and when DOM changes.
+ */
+function observeNewImages() {
     // Evict old entries if cache is getting too large
     evictOldestEntries();
 
-    for (const img of validImgs) {
+    const imgs = document.querySelectorAll('img');
+    
+    for (const img of imgs) {
+        // Skip if already observing or processed
+        if (observedImages.has(img)) continue;
+        
         const src = getImageSrc(img);
-
-        // Skip if already processed
-        if (processedSrcUrls.has(src)) {
-            const knownHash = processedSrcUrls.get(src);
-            const srcSet = hashToSrcUrls.get(knownHash);
-            if (srcSet && srcSet.size > 1) {
-                markDuplicateThumbnail(img, srcSet.size);
+        if (processedSrcUrls.has(src) || failedUrls.has(src)) {
+            // Already processed - just re-apply highlighting if needed
+            if (processedSrcUrls.has(src)) {
+                const knownHash = processedSrcUrls.get(src);
+                const srcSet = hashToSrcUrls.get(knownHash);
+                if (srcSet && srcSet.size > 1) {
+                    markDuplicateThumbnail(img, srcSet.size);
+                }
             }
             continue;
         }
 
-        // Skip if previously failed
-        if (failedUrls.has(src)) continue;
-
-        // Queue for hashing (non-blocking - allows parallel processing)
-        window.ThumbHash.queueHash(src).then((realHash) => {
-            // Handle failure
-            if (!realHash) {
-                failedUrls.add(src);
-                return;
-            }
-
-            // Skip solid-color placeholders
-            if (isSolidColor(realHash)) return;
-
-            // Find matching hash (exact or near-duplicate via Hamming)
-            const matchKey = findMatchingHash(realHash, hashToSrcUrls);
-            const targetKey = matchKey || realHash;
-
-            // Record this src -> hash mapping
-            processedSrcUrls.set(src, targetKey);
-
-            // Track all src URLs that share this hash
-            if (!hashToSrcUrls.has(targetKey)) {
-                hashToSrcUrls.set(targetKey, new Set());
-            }
-            hashToSrcUrls.get(targetKey).add(src);
-
-            const matchingSrcs = hashToSrcUrls.get(targetKey);
-
-            // If multiple DIFFERENT src URLs produce the same hash = visual duplicate
-            if (matchingSrcs.size > 1) {
-                console.log(`%c[DUPLICATE FOUND]`, 'background: #c41; color: white; padding: 2px 6px; border-radius: 3px;', {
-                    hash: targetKey.substring(0, 16) + '...',
-                    count: matchingSrcs.size
-                });
-
-                // Mark all currently visible images that match this hash
-                updateAllMatchingImages(targetKey);
-            }
-        });
+        // Start observing this image
+        observedImages.add(img);
+        imageObserver.observe(img);
     }
+}
+
+// Legacy function name for compatibility with manual rescan shortcut
+function processPage() {
+    observeNewImages();
 }
 
 // --- KEYBOARD SHORTCUTS ---
@@ -365,14 +431,14 @@ window.addEventListener('keydown', (e) => {
 // --- MUTATION OBSERVER (SPA SUPPORT) ---
 
 let debounceTimer = null;
-const observer = new MutationObserver(() => {
+const domObserver = new MutationObserver(() => {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(processPage, 1000);
+    debounceTimer = setTimeout(observeNewImages, 500); // Faster debounce since we're just observing
 });
 
-observer.observe(document.body, { childList: true, subtree: true });
+domObserver.observe(document.body, { childList: true, subtree: true });
 
-console.log("[DuplicateHighlighter] Watching for content changes...");
+console.log("[DuplicateHighlighter] Ready. Using IntersectionObserver + 5 parallel fetches.");
 
 // Initial scan
-setTimeout(processPage, 1000);
+setTimeout(observeNewImages, 500);
